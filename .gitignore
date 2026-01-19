@@ -1,0 +1,8 @@
+# Ignora la cartella del dataset scaricato, i dati generati ed ambienti virtuali
+data/ 
+outputs/
+__pycache__/
+*.pth
+.DS_Store
+.venv
+venv/
