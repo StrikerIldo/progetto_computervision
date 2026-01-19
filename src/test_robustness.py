@@ -9,8 +9,8 @@ import os
 
 # --- CONFIGURAZIONE ---
 DATA_PATH = './data'
-MODEL_PATH = './models/model_baseline.pth'
-OUTPUT_DIR = './outputs/robustness_test'
+MODEL_PATH = './models/model_robust.pth'
+OUTPUT_DIR = './outputs/robustness_test_SUCCESS'
 
 def calculate_iou(pred_mask, true_mask):
     """Calcola l'Intersection over Union (IoU) per una singola coppia."""

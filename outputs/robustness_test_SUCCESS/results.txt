@@ -1,0 +1,3 @@
+Baseline Clean IoU: 0.4472
+Corrupted IoU: 0.4189
+Drop: 2.83%
