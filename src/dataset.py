@@ -20,7 +20,7 @@ class PetDataset(Dataset):
         self.img_transform = transforms.Compose([
             transforms.Resize((256, 256)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[-0.0293, -0.0453, -0.0458], std=[1.1496, 1.1509, 1.1818])
         ])
 
         # Trasformazioni per la maschera (Target)
