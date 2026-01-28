@@ -1,169 +1,125 @@
 import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from unet import UNet
-from dataset import PetDataset
-import matplotlib.pyplot as plt
 import numpy as np
-import os
+from tqdm import tqdm
+from unet import MiniUNet
+from dataset import PetDataset
 
 # --- CONFIGURAZIONE ---
 DATA_PATH = './data'
-MODEL_PATH = './models/model_robust.pth'
-OUTPUT_DIR = './outputs/robustness_test_SUCCESS'
+MODEL_PATH = './models/model_robust.pth' 
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+BATCH_SIZE = 1
 
-def calculate_iou(pred_mask, true_mask):
-    """Calcola l'Intersection over Union (IoU) per una singola coppia."""
-    # Sigmoid e soglia a 0.5 per binarizzare
-    pred_mask = torch.sigmoid(pred_mask) > 0.5
-    true_mask = true_mask > 0.5
-    
-    intersection = (pred_mask & true_mask).sum().item()
-    union = (pred_mask | true_mask).sum().item()
-    
-    if union == 0: return 1.0
+# --- DEFINIZIONE CORRUZIONI (Stesse usate nel training) ---
+# Nota: Usiamo 128x128 per coerenza con la MiniUNet
+clean_transform = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+corrupted_transform = transforms.Compose([
+    transforms.Resize((128, 128)),
+    # Applichiamo le corruzioni per testare la robustezza
+    transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.2),
+    transforms.GaussianBlur(kernel_size=5, sigma=1.5),
+    transforms.ToTensor(),
+    transforms.Lambda(lambda x: x + 0.1 * torch.randn_like(x)), # Rumore
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+mask_transform = transforms.Compose([
+    transforms.Resize((128, 128), interpolation=transforms.InterpolationMode.NEAREST),
+    transforms.PILToTensor() # Restituisce 0, 1, 2
+])
+
+def calculate_iou(pred, target):
+    # Pred è già sigmoidata e binarizzata (0 o 1)
+    intersection = (pred * target).sum()
+    union = pred.sum() + target.sum() - intersection
+    if union == 0:
+        return 1.0
     return intersection / union
 
-def get_corrupted_transforms():
-    """
-    Definisce le trasformazioni 'cattive' per simulare il Domain Shift.
-    Nota: Applichiamo queste trasformazioni SOLO alle immagini, non alle maschere!
-    """
-    base_transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+def test_robustness():
+    print(f"🧐 Avvio Test Robustezza usando MiniUNet su {DEVICE}...")
     
-    # Aggiungiamo rumore e cambi di colore
-    corruption_transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        # ColorJitter simula condizioni di luce pessime
-        transforms.ColorJitter(brightness=0.8, contrast=0.8, saturation=0.8, hue=0.2),
-        # GaussianBlur simula foto sfocate
-        transforms.GaussianBlur(kernel_size=5, sigma=(2.0, 5.0)),
-        transforms.ToTensor(),
-        # Aggiunta manuale di rumore Gaussiano
-        transforms.Lambda(lambda x: x + 0.1 * torch.randn_like(x)),
-        # Clamp per tenere i valori validi prima della normalizzazione
-        transforms.Lambda(lambda x: torch.clamp(x, 0, 1)),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    return base_transform, corruption_transform
-
-def test():
-    # Setup
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    print("Caricamento modello...")
-    model = UNet(in_channels=3, out_channels=1).to(device)
+    # 1. Carica il Modello
+    model = MiniUNet(in_channels=3, out_channels=1).to(DEVICE)
     try:
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-        print("✅ Modello caricato con successo.")
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+        print("✅ Modello Robusto caricato correttamente.")
     except FileNotFoundError:
-        print(f"❌ Errore: Il file {MODEL_PATH} non esiste. Attendi la fine del training!")
+        print(f"❌ Errore: Non trovo il file {MODEL_PATH}. Controlla il nome.")
         return
 
     model.eval()
+
+    # 2. Prepara i Dataset (Clean vs Corrupted)
+    # Usiamo 'test' se esiste, altrimenti una parte di 'trainval'
+    dataset_clean = PetDataset(root_dir=DATA_PATH, split='trainval')
+    dataset_clean.img_transform = clean_transform
+    dataset_clean.mask_transform = mask_transform
     
-    # Prepariamo due dataset: uno PULITO e uno SPORCO (Corrupted)
-    clean_transform, dirty_transform = get_corrupted_transforms()
-    
-    # Dataset di test (usiamo 'test' split se disponibile, altrimenti 'trainval' parziale)
-    # Nota: Stiamo forzando la trasformazione sovrascrivendo l'attributo nel dataset wrapper
-    dataset = PetDataset(root_dir=DATA_PATH, split='trainval')
-    
-    # Limitiamo a 100 immagini per il test rapido
+    dataset_corr = PetDataset(root_dir=DATA_PATH, split='trainval')
+    dataset_corr.img_transform = corrupted_transform # Qui la magia del test
+    dataset_corr.mask_transform = mask_transform
+
+    # Limitiamo il test a 100 immagini per velocità
     indices = list(range(100))
-    subset = torch.utils.data.Subset(dataset, indices)
-    test_loader = DataLoader(subset, batch_size=1, shuffle=False)
-    
-    clean_ious = []
-    dirty_ious = []
-    
-    print("\n--- INIZIO TEST DI ROBUSTEZZA ---")
-    
+    subset_clean = torch.utils.data.Subset(dataset_clean, indices)
+    subset_corr = torch.utils.data.Subset(dataset_corr, indices)
+
+    loader_clean = DataLoader(subset_clean, batch_size=BATCH_SIZE, shuffle=False)
+    loader_corr = DataLoader(subset_corr, batch_size=BATCH_SIZE, shuffle=False)
+
+    # 3. Loop di Valutazione
+    iou_clean_list = []
+    iou_corr_list = []
+
+    print("   Calcolo IoU su dati PULITI...")
     with torch.no_grad():
-        for idx, (image, mask) in enumerate(test_loader):
-            mask = mask.to(device)
+        for img, mask in tqdm(loader_clean):
+            img = img.to(DEVICE)
+            mask = mask.to(DEVICE)
+            # Normalizziamo la maschera a 0/1 (Pet/Sfondo)
+            mask = (mask == 1).float() 
             
-            # --- TEST 1: IMMAGINE PULITA ---
-            # Reimpostiamo la trasformazione pulita 'al volo' (un po' hacky ma efficace per il test)
-            # Nota: Poiché il dataloader ha già trasformato l'immagine, qui stiamo facendo un trucco.
-            # Per farlo bene dovremmo ricaricare l'immagine originale, ma per semplicità
-            # applichiamo il rumore direttamente al tensore o usiamo due dataset distinti.
-            #
-            # CORREZIONE PER SEMPLICITÀ:
-            # Poiché PetDataset applica le trasformazioni nel __getitem__, 
-            # il modo più pulito è istanziare due dataset diversi.
-            pass 
+            output = model(img)
+            pred = (torch.sigmoid(output) > 0.5).float()
+            iou_clean_list.append(calculate_iou(pred, mask).item())
 
-    # --- RISCRIVO LA LOGICA DEL LOOP PER CHIAREZZA ---
-    # Per fare un confronto onesto, carichiamo l'immagine Raw e applichiamo le due pipeline
-    raw_dataset = dataset.base_dataset # Accesso al dataset originale torchvision
-    
-    for i in range(20): # Testiamo su 20 immagini
-        raw_img, raw_mask = raw_dataset[i]
-        
-        # 1. Preparazione Ground Truth
-        mask_tensor = dataset.mask_transform(raw_mask)
-        mask_tensor = mask_tensor - 1
-        mask_tensor = torch.where(mask_tensor == 0, 1.0, 0.0).unsqueeze(0).to(device) # Add batch dim
+    print("   Calcolo IoU su dati CORROTTI (Domain Shift)...")
+    with torch.no_grad():
+        for img, mask in tqdm(loader_corr):
+            img = img.to(DEVICE)
+            mask = mask.to(DEVICE)
+            mask = (mask == 1).float()
+            
+            output = model(img)
+            pred = (torch.sigmoid(output) > 0.5).float()
+            iou_corr_list.append(calculate_iou(pred, mask).item())
 
-        # 2. Pipeline PULITA
-        img_clean = clean_transform(raw_img).unsqueeze(0).to(device)
-        out_clean = model(img_clean)
-        iou_clean = calculate_iou(out_clean, mask_tensor)
-        clean_ious.append(iou_clean)
-        
-        # 3. Pipeline SPORCA (Domain Shift)
-        img_dirty = dirty_transform(raw_img).unsqueeze(0).to(device)
-        out_dirty = model(img_dirty)
-        iou_dirty = calculate_iou(out_dirty, mask_tensor)
-        dirty_ious.append(iou_dirty)
-        
-        # Salva un esempio visivo (solo il primo)
-        if i == 0:
-            fig, ax = plt.subplots(2, 3, figsize=(12, 8))
-            
-            # Riga 1: Pulito
-            # Denormalizziamo per visualizzare
-            disp_clean = img_clean.squeeze().cpu().permute(1, 2, 0) * 0.229 + 0.485
-            ax[0,0].imshow(np.clip(disp_clean, 0, 1))
-            ax[0,0].set_title("Input Pulito")
-            ax[0,1].imshow(torch.sigmoid(out_clean).squeeze().cpu() > 0.5, cmap='gray')
-            ax[0,1].set_title(f"Predizione (IoU: {iou_clean:.2f})")
-            ax[0,2].imshow(mask_tensor.squeeze().cpu(), cmap='gray')
-            ax[0,2].set_title("Ground Truth")
-            
-            # Riga 2: Sporco
-            disp_dirty = img_dirty.squeeze().cpu().permute(1, 2, 0) * 0.229 + 0.485
-            ax[1,0].imshow(np.clip(disp_dirty, 0, 1))
-            ax[1,0].set_title("Input Corrotto (Domain Shift)")
-            ax[1,1].imshow(torch.sigmoid(out_dirty).squeeze().cpu() > 0.5, cmap='gray')
-            ax[1,1].set_title(f"Predizione (IoU: {iou_dirty:.2f})")
-            ax[1,2].imshow(mask_tensor.squeeze().cpu(), cmap='gray')
-            ax[1,2].set_title("Ground Truth")
-            
-            plt.tight_layout()
-            plt.savefig(f"{OUTPUT_DIR}/comparison.png")
-            print(f"Salvato esempio visivo in {OUTPUT_DIR}/comparison.png")
+    # 4. Risultati Finali
+    mean_iou_clean = np.mean(iou_clean_list)
+    mean_iou_corr = np.mean(iou_corr_list)
+    drop = ((mean_iou_clean - mean_iou_corr) / mean_iou_clean) * 100
 
-    avg_clean = sum(clean_ious) / len(clean_ious)
-    avg_dirty = sum(dirty_ious) / len(dirty_ious)
-    
-    print("\n--- RISULTATI ---")
-    print(f"IoU Medio (Immagini Pulite): {avg_clean:.4f}")
-    print(f"IoU Medio (Immagini Corrotte): {avg_dirty:.4f}")
-    print(f"DROP DI PERFORMANCE: -{(avg_clean - avg_dirty)*100:.2f}%")
-    
-    # Scrivi un piccolo report txt
-    with open(f"{OUTPUT_DIR}/results.txt", "w") as f:
-        f.write(f"Baseline Clean IoU: {avg_clean:.4f}\n")
-        f.write(f"Corrupted IoU: {avg_dirty:.4f}\n")
-        f.write(f"Drop: {(avg_clean - avg_dirty)*100:.2f}%\n")
+    print("\n" + "="*30)
+    print("RISULTATI FINALI ROBUSTEZZA")
+    print("="*30)
+    print(f"Modello: {MODEL_PATH}")
+    print(f"IoU Medio (Clean):     {mean_iou_clean:.4f}")
+    print(f"IoU Medio (Corrupted): {mean_iou_corr:.4f}")
+    print(f"Performance Drop:      {drop:.2f}%")
+    print("="*30)
+
+    if mean_iou_corr > 0.30:
+        print("✅ SUCCESSO: Il modello ha recuperato la capacità di vedere nel rumore!")
+    else:
+        print("⚠️ ATTENZIONE: IoU ancora basso. Forse serve più training.")
 
 if __name__ == "__main__":
-    test()
+    test_robustness()

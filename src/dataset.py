@@ -14,19 +14,19 @@ class PetDataset(Dataset):
         self.base_dataset = OxfordIIITPet(root=root_dir, split=split, target_types='segmentation', download=False)
         
         # Trasformazioni per l'immagine di input (RGB)
-        # 1. Resize a 256x256
+        # 1. Resize a 128x128 per velocità
         # 2. Converti a Tensore
         # 3. Normalizza (media e deviazione standard standard di ImageNet)
         self.img_transform = transforms.Compose([
-            transforms.Resize((256, 256)),
+            transforms.Resize((128, 128)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[-0.0293, -0.0453, -0.0458], std=[1.1496, 1.1509, 1.1818])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
         # Trasformazioni per la maschera (Target)
         # Resize con INTER_NEAREST per non introdurre valori grigi (vogliamo solo classi intere)
         self.mask_transform = transforms.Compose([
-            transforms.Resize((256, 256), interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.Resize((128, 128), interpolation=transforms.InterpolationMode.NEAREST),
             transforms.PILToTensor() 
         ])
 
