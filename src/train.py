@@ -11,7 +11,7 @@ import time
 # --- CONFIGURAZIONE PER IL PROF ---
 BATCH_SIZE = 8
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 10
+NUM_EPOCHS = 25
 DATA_PATH = './data'
 
 def train_and_analyze():
